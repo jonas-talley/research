@@ -13,12 +13,13 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Slot
 from serial_worker import SerialWorker
 from protocol import *
-from aerotech_worker import AerotechWorker
+import math
+from aerotech import AerotechDriver
 
 class DIWController(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("DIW Control System - Absolute Mode")
+        self.setWindowTitle("DIW Control System - Integrated Mode")
         self.resize(1100, 950) 
 
         # Config
@@ -33,15 +34,14 @@ class DIWController(QMainWindow):
             'velocity_tgt': deque(maxlen=self.plot_history_size),
             'position_steps': deque(maxlen=self.plot_history_size)
         }
-        self.pending_moves = [] 
-
-        self.aero_thread = None
-        self.aero_worker = None
         
+        # Execution Queues
+        self.pending_moves = [] # For Teensy [(vel, ms), ...]
+        self.pending_pgm = None # For Aerotech (List of strings)
+        self.loaded_filename = ""
+
         self.setup_ui()
         self.start_connection()
-
-        self.start_aerotech_connection()
 
     def setup_ui(self):
         main_widget = QWidget()
@@ -70,7 +70,7 @@ class DIWController(QMainWindow):
         self.setup_manual_tab(self.tab_manual)
         tabs.addTab(self.tab_manual, "Manual Control")
 
-        # Tab 2: Streamer
+        # Tab 2: Smart Streamer (Replaces CSV & GCode tabs)
         self.tab_stream = QWidget()
         self.setup_stream_tab(self.tab_stream)
         tabs.addTab(self.tab_stream, "Trajectory Streamer")
@@ -82,11 +82,6 @@ class DIWController(QMainWindow):
 
         # 3. Plots
         self.setup_plots(layout)
-
-        # Tab 4: Motion Platform (Aerotech)
-        self.tab_motion = QWidget()
-        self.setup_motion_tab(self.tab_motion)
-        tabs.addTab(self.tab_motion, "Motion Platform")
 
     def setup_manual_tab(self, parent):
         layout = QVBoxLayout(parent)
@@ -104,7 +99,7 @@ class DIWController(QMainWindow):
         grp_vel.setLayout(vel_layout)
         layout.addWidget(grp_vel)
 
-        # B. Position Control (Move Relative)
+        # B. Position Control
         grp_pos = QGroupBox("2. Step Control (Move Relative)")
         pos_layout = QHBoxLayout()
         
@@ -141,11 +136,18 @@ class DIWController(QMainWindow):
     def setup_stream_tab(self, parent):
         layout = QVBoxLayout(parent)
         
+        # Instructions
+        layout.addWidget(QLabel("Supports: .csv (Teensy Only) AND .gcode/.nc (Aerotech + Teensy)"))
+
         # File Loading
         file_layout = QHBoxLayout()
         self.lbl_filename = QLabel("No file loaded")
-        btn_load = QPushButton("Load CSV...")
-        btn_load.clicked.connect(self.load_csv)
+        self.lbl_filename.setStyleSheet("font-weight: bold;")
+        
+        btn_load = QPushButton("Load File...")
+        btn_load.setMinimumHeight(40)
+        btn_load.clicked.connect(self.load_file)
+        
         file_layout.addWidget(btn_load)
         file_layout.addWidget(self.lbl_filename)
         layout.addLayout(file_layout)
@@ -153,22 +155,27 @@ class DIWController(QMainWindow):
         # Controls
         ctrl_layout = QHBoxLayout()
         btn_start = QPushButton("Start Stream")
-        btn_start.setStyleSheet("background-color: green; color: white;")
+        btn_start.setMinimumHeight(50)
+        btn_start.setStyleSheet("background-color: green; color: white; font-size: 14px;")
         btn_start.clicked.connect(self.start_streaming)
-        btn_abort = QPushButton("Abort")
+        
+        btn_abort = QPushButton("Abort / Reset")
+        btn_abort.setMinimumHeight(50)
+        btn_abort.setStyleSheet("background-color: #e74c3c; color: white; font-size: 14px;")
         btn_abort.clicked.connect(self.abort_stream)
+        
         ctrl_layout.addWidget(btn_start)
         ctrl_layout.addWidget(btn_abort)
         layout.addLayout(ctrl_layout)
 
         # Progress
         self.prog_stream = QProgressBar()
-        layout.addWidget(QLabel("CSV Progress:"))
+        layout.addWidget(QLabel("Playlist Progress:"))
         layout.addWidget(self.prog_stream)
         
         self.prog_buffer = QProgressBar()
         self.prog_buffer.setRange(0, 64)
-        self.prog_buffer.setFormat("Buffer: %v / 64")
+        self.prog_buffer.setFormat("Hardware Buffer: %v / 64")
         layout.addWidget(self.prog_buffer)
         layout.addStretch()
 
@@ -179,21 +186,16 @@ class DIWController(QMainWindow):
         grp_log = QGroupBox("Data Logging")
         log_layout = QVBoxLayout()
         
-        # Current Log Label
         self.lbl_log_status = QLabel("Logging to: Default")
         self.lbl_log_status.setStyleSheet("color: blue;")
         log_layout.addWidget(self.lbl_log_status)
 
-        # File Change Inputs
         file_input_layout = QHBoxLayout()
         self.txt_log_name = QLineEdit()
-        self.txt_log_name.setPlaceholderText("Enter new filename (e.g. experiment_1.csv)")
-        
-        # Pre-fill with a timestamp
         default_ts = f"exp_{datetime.datetime.now().strftime('%H%M')}.csv"
         self.txt_log_name.setText(default_ts)
 
-        btn_apply_log = QPushButton("Apply / Switch Log File")
+        btn_apply_log = QPushButton("Apply Log File")
         btn_apply_log.clicked.connect(self.cmd_update_log_name)
 
         file_input_layout.addWidget(QLabel("Filename:"))
@@ -214,7 +216,7 @@ class DIWController(QMainWindow):
         self.spin_points.setSingleStep(100)
         self.spin_points.valueChanged.connect(self.update_plot_settings)
         
-        plot_layout.addWidget(QLabel("History Points (Time Window):"))
+        plot_layout.addWidget(QLabel("History Points:"))
         plot_layout.addWidget(self.spin_points)
         plot_layout.addStretch()
         grp_plot.setLayout(plot_layout)
@@ -229,110 +231,25 @@ class DIWController(QMainWindow):
         # Plot 0: Position
         self.p0 = self.plot_widget.addPlot(title="Position (Steps)")
         self.p0.showGrid(x=True, y=True)
-        self.p0.setLabel('left', 'Steps')
         self.curve_pos = self.p0.plot(pen=pg.mkPen('m', width=2))
-        
         self.plot_widget.nextRow()
 
         # Plot 1: Velocity
         self.p1 = self.plot_widget.addPlot(title="Velocity (um/s)")
         self.p1.showGrid(x=True, y=True)
-        self.p1.setLabel('left', 'um/s')
         self.p1.addLegend()
         self.curve_vel_tgt = self.p1.plot(pen=pg.mkPen('g', width=2, style=Qt.DashLine), name='Target')
         self.curve_vel_cur = self.p1.plot(pen=pg.mkPen('y', width=2), name='Current')
         self.p1.setXLink(self.p0)
-
         self.plot_widget.nextRow()
 
         # Plot 2: Pressure
         self.p2 = self.plot_widget.addPlot(title="Pressure (kPa)")
         self.p2.showGrid(x=True, y=True)
-        self.p2.setLabel('left', 'kPa')
-        self.p2.setLabel('bottom', 'Time (s)')
         self.curve_pressure = self.p2.plot(pen=pg.mkPen('c', width=2))
         self.p2.setXLink(self.p0)
 
         parent_layout.addWidget(self.plot_widget)
-
-    def setup_motion_tab(self, parent):
-        layout = QVBoxLayout(parent)
-        
-        # Status Header
-        self.lbl_aero_status = QLabel("Aerotech: Disconnected")
-        self.lbl_aero_status.setStyleSheet("font-weight: bold; color: red;")
-        layout.addWidget(self.lbl_aero_status)
-
-        # Position Readout
-        self.lbl_aero_pos = QLabel("X: 0.000 | Y: 0.000 | Z: 0.000")
-        self.lbl_aero_pos.setStyleSheet("font-size: 20px; font-weight: bold; color: blue; border: 1px solid gray; padding: 10px;")
-        layout.addWidget(self.lbl_aero_pos)
-
-        # --- ENABLE CONTROLS (NEW) ---
-        grp_power = QGroupBox("Motor Power")
-        power_layout = QHBoxLayout()
-        
-        btn_enable = QPushButton("ENABLE ALL AXES")
-        btn_enable.setStyleSheet("background-color: #90EE90; font-weight: bold; height: 35px;")
-        btn_enable.clicked.connect(self.cmd_enable_motors)
-        
-        btn_disable = QPushButton("DISABLE ALL")
-        btn_disable.setStyleSheet("background-color: #FFB6C1; height: 35px;")
-        btn_disable.clicked.connect(self.cmd_disable_motors)
-        
-        power_layout.addWidget(btn_enable)
-        power_layout.addWidget(btn_disable)
-        grp_power.setLayout(power_layout)
-        layout.addWidget(grp_power)
-        # -----------------------------
-
-        # Jog Controls
-        grp_jog = QGroupBox("Jog Controls")
-        grid = QVBoxLayout()
-        
-        # Speed & Step Inputs
-        param_layout = QHBoxLayout()
-        self.txt_aero_speed = QLineEdit("10")
-        self.txt_aero_speed.setPlaceholderText("Speed (mm/s)")
-        self.txt_aero_step = QLineEdit("1.0")
-        self.txt_aero_step.setPlaceholderText("Step (mm)")
-        
-        param_layout.addWidget(QLabel("Speed (mm/s):"))
-        param_layout.addWidget(self.txt_aero_speed)
-        param_layout.addWidget(QLabel("Step (mm):"))
-        param_layout.addWidget(self.txt_aero_step)
-        grid.addLayout(param_layout)
-
-        # Axis Buttons
-        def make_axis_row(axis):
-            row = QHBoxLayout()
-            row.addWidget(QLabel(f"{axis} Axis:", alignment=Qt.AlignRight))
-            
-            btn_neg = QPushButton(f"- {axis}")
-            btn_neg.setMinimumHeight(40)
-            btn_neg.clicked.connect(lambda: self.cmd_jog_aerotech(axis, -1))
-            
-            btn_pos = QPushButton(f"+ {axis}")
-            btn_pos.setMinimumHeight(40)
-            btn_pos.clicked.connect(lambda: self.cmd_jog_aerotech(axis, 1))
-            
-            row.addWidget(btn_neg)
-            row.addWidget(btn_pos)
-            return row
-
-        grid.addLayout(make_axis_row("X"))
-        grid.addLayout(make_axis_row("Y"))
-        grid.addLayout(make_axis_row("Z"))
-        
-        # Stop Button
-        btn_stop = QPushButton("STOP MOTION")
-        btn_stop.setStyleSheet("background-color: red; color: white; font-weight: bold; height: 50px;")
-        btn_stop.clicked.connect(self.cmd_stop_aerotech)
-        grid.addWidget(btn_stop)
-
-        grp_jog.setLayout(grid)
-        layout.addWidget(grp_jog)
-        layout.addStretch()
 
     # --- Logic ---
     def start_connection(self):
@@ -341,13 +258,166 @@ class DIWController(QMainWindow):
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         
-        # Signals
         self.worker.telemetry_received.connect(self.update_plots)
         self.worker.connected.connect(lambda p: self.lbl_status.setText(f"Connected: {p}"))
         self.worker.stream_progress.connect(self.prog_stream.setValue)
-        self.worker.log_status_changed.connect(self.lbl_log_status.setText) # Feedback connection
+        self.worker.log_status_changed.connect(self.lbl_log_status.setText)
         
         self.thread.start()
+
+    def load_file(self):
+        """Smart loader that handles both CSV and GCode"""
+        fname, _ = QFileDialog.getOpenFileName(self, "Open File", "", "Files (*.csv *.gcode *.nc *.txt)")
+        if not fname: return
+
+        self.loaded_filename = fname
+        ext = os.path.splitext(fname)[1].lower()
+        self.lbl_filename.setText(f"Loading {os.path.basename(fname)}...")
+        QApplication.processEvents()
+
+        try:
+            # Mode 1: CSV (Teensy Only)
+            if ext == '.csv':
+                self.pending_pgm = None # Disable Aerotech Logic
+                df = pd.read_csv(fname)
+                times = df['Time'].values
+                vels = df['Velocity'].values
+                moves = []
+                for i in range(len(times)-1):
+                    dt = (times[i+1] - times[i]) * 1000.0
+                    if dt > 0: moves.append((float(vels[i]), float(dt)))
+                
+                self.pending_moves = moves
+                self.lbl_filename.setText(f"{os.path.basename(fname)} [CSV: {len(moves)} pts]")
+            
+            # Mode 2: G-Code (Dual Stream)
+            elif ext in ['.gcode', '.nc', '.txt']:
+                pgm_lines, teensy_moves = self.parse_gcode_to_dual_streams(fname)
+                self.pending_pgm = pgm_lines
+                self.pending_moves = teensy_moves
+                self.lbl_filename.setText(f"{os.path.basename(fname)} [G-Code: {len(teensy_moves)} moves]")
+
+            self.prog_stream.setMaximum(len(self.pending_moves))
+            self.prog_stream.setValue(0)
+            
+        except Exception as e:
+            self.lbl_filename.setText("Error loading file")
+            QMessageBox.critical(self, "Load Error", str(e))
+
+    def parse_gcode_to_dual_streams(self, gcode_filepath):
+        aerotech_lines = [
+            "ENABLE X",
+            "ENABLE Y",
+            "ENABLE Z",
+            "INCREMENTAL",
+            "METRIC", 
+            "VELOCITY ON", 
+            "WAIT MODE AUTO"
+        ]
+        
+        teensy_moves = []
+        last_f_rate = 1.0 
+        
+        with open(gcode_filepath, 'r') as f:
+            lines = f.readlines()
+
+        for line in lines:
+            line = line.strip().upper()
+            if not line or line.startswith(';') or line.startswith('('): 
+                continue
+            
+            if line.startswith('G1'):
+                dx, dy, dz, de = 0.0, 0.0, 0.0, 0.0
+                current_f = None
+                
+                parts = line.split()
+                for p in parts:
+                    if p.startswith('X'): dx = float(p[1:])
+                    if p.startswith('Y'): dy = float(p[1:])
+                    if p.startswith('Z'): dz = float(p[1:])
+                    if p.startswith('E'): de = float(p[1:])
+                    if p.startswith('F'): current_f = float(p[1:])
+                
+                if current_f is not None:
+                    last_f_rate = current_f
+                
+                # Geometry & Timing
+                distance = math.sqrt(dx**2 + dy**2 + dz**2)
+                if distance <= 0.0001: continue
+
+                # Duration in Seconds
+                duration_sec = distance / last_f_rate 
+                
+                # 1. Aerotech Command
+                aero_cmd = f"G1 X{dx:.4f} Y{dy:.4f} Z{dz:.4f} F{last_f_rate:.4f}"
+                aerotech_lines.append(aero_cmd)
+                
+
+                
+                # Convert to ms for Protocol
+                duration_ms = duration_sec * 1000.0
+                
+                teensy_moves.append((de, duration_ms))
+
+        aerotech_lines.append("END PROGRAM")
+        return aerotech_lines, teensy_moves
+
+    def start_streaming(self):
+        if not self.pending_moves:
+            return
+
+        print("Starting execution sequence...")
+
+        # 1. Handle Aerotech (If G-Code mode)
+        if self.pending_pgm:
+            pgm_filename = "diw_job.pgm"
+            driver = AerotechDriver() 
+            save_path = os.path.join(driver.user_files_path, pgm_filename)
+            
+            # Directory Safety Check
+            folder_path = os.path.dirname(save_path)
+            if not os.path.exists(folder_path):
+                try:
+                    os.makedirs(folder_path, exist_ok=True)
+                except Exception as e:
+                    QMessageBox.critical(self, "System Error", f"Cannot create Aerotech folder: {e}")
+                    return
+
+            # Write PGM
+            try:
+                with open(save_path, "w") as f:
+                    f.write("\n".join(self.pending_pgm))
+            except Exception as e:
+                QMessageBox.critical(self, "Write Error", f"Failed to save PGM file: {e}")
+                return
+
+            # Trigger Stage Motion
+            # We queue the Teensy FIRST so it's ready the instant the stage moves
+            print("Uploading to Stage...")
+            success, msg = driver.run_pgm(pgm_filename)
+            if not success:
+                QMessageBox.critical(self, "Stage Error", f"Aerotech refused start: {msg}")
+                return
+            print("Stage Started.")
+
+        # 2. Start Teensy (Common to both modes)
+        # This will start feeding the buffer immediately.
+        # If manual CSV, it just runs. If G-Code, it runs in sync with the file we just triggered.
+        self.worker.queue_stream(self.pending_moves)
+        print("Teensy Stream Started.")
+
+    def abort_stream(self):
+        # 1. Stop Teensy
+        self.worker.queue_stream([])
+        self.worker.send_command(CMD_CLEAR_QUEUE)
+        
+        # 2. Stop Aerotech (Blind Abort)
+        if self.pending_pgm:
+            try:
+                driver = AerotechDriver()
+                driver.reset_task(1)
+            except:
+                pass
 
     def cmd_set_velocity(self):
         try:
@@ -363,7 +433,7 @@ class DIWController(QMainWindow):
             if speed <= 0: speed = 500.0
             self.worker.send_command(CMD_MOVE_RELATIVE, val_a=steps, val_b=speed)
         except ValueError:
-            QMessageBox.warning(self, "Error", "Invalid Step or Speed value")
+            pass
 
     def cmd_stop(self):
         self.worker.send_command(CMD_SET_VELOCITY, val_a=0.0)
@@ -371,14 +441,8 @@ class DIWController(QMainWindow):
 
     def cmd_update_log_name(self):
         fname = self.txt_log_name.text().strip()
-        if not fname:
-            QMessageBox.warning(self, "Error", "Filename cannot be empty")
-            return
-        if not fname.endswith(".csv"):
-            fname += ".csv"
-        
-        # Send to worker
-        # Note: calling this directly is safe because the worker method uses mutex locks
+        if not fname: return
+        if not fname.endswith(".csv"): fname += ".csv"
         self.worker.change_log_file(fname)
 
     def update_plot_settings(self):
@@ -386,31 +450,6 @@ class DIWController(QMainWindow):
         self.plot_history_size = new_size
         for k in self.data_history:
             self.data_history[k] = deque(self.data_history[k], maxlen=new_size)
-
-    def load_csv(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv)")
-        if fname:
-            try:
-                df = pd.read_csv(fname)
-                times = df['Time'].values
-                vels = df['Velocity'].values
-                moves = []
-                for i in range(len(times)-1):
-                    dt = (times[i+1] - times[i]) * 1000.0
-                    if dt > 0: moves.append((float(vels[i]), float(dt)))
-                self.pending_moves = moves
-                self.lbl_filename.setText(f"{os.path.basename(fname)} ({len(moves)} pts)")
-                self.prog_stream.setMaximum(len(moves))
-            except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
-
-    def start_streaming(self):
-        if self.pending_moves:
-            self.worker.queue_stream(self.pending_moves)
-
-    def abort_stream(self):
-        self.worker.queue_stream([])
-        self.worker.send_command(CMD_CLEAR_QUEUE)
 
     @Slot(dict)
     def update_plots(self, data):
@@ -438,69 +477,6 @@ class DIWController(QMainWindow):
         self.thread.quit()
         self.thread.wait()
         event.accept()
-
-    def start_aerotech_connection(self):
-        self.aero_thread = QThread()
-        self.aero_worker = AerotechWorker()
-        self.aero_worker.moveToThread(self.aero_thread)
-        
-        self.aero_thread.started.connect(self.aero_worker.run)
-        
-        # Signals
-        self.aero_worker.connected.connect(lambda: self.lbl_aero_status.setText("Aerotech: Connected"))
-        self.aero_worker.connected.connect(lambda: self.lbl_aero_status.setStyleSheet("color: green; font-weight: bold;"))
-        self.aero_worker.connection_error.connect(lambda e: self.lbl_aero_status.setText(f"Aerotech Error: {e}"))
-        self.aero_worker.pos_updated.connect(self.update_aero_pos)
-        
-        self.aero_thread.start()
-
-    @Slot(float, float, float)
-    def update_aero_pos(self, x, y, z):
-        self.lbl_aero_pos.setText(f"X: {x:.3f} | Y: {y:.3f} | Z: {z:.3f}")
-
-    def cmd_jog_aerotech(self, axis, direction):
-        try:
-            step = float(self.txt_aero_step.text())
-            speed = float(self.txt_aero_speed.text())
-            
-            # Send to worker
-            # Note: Since this calls a .NET function, strictly speaking we should emit a signal 
-            # connected to the worker slot, but for this simple test, direct call is usually fine.
-            # Ideally: self.jog_signal.emit(axis, step*direction, speed)
-            self.aero_worker.move_relative(axis, step * direction, speed)
-        except ValueError:
-            pass
-
-    def cmd_stop_aerotech(self):
-        self.aero_worker.stop_all()
-
-    # Update closeEvent to clean up Aerotech too
-    def closeEvent(self, event):
-        # Stop Serial
-        self.worker.disconnect_serial()
-        self.thread.quit()
-        self.thread.wait()
-        
-        # Stop Aerotech
-        if self.aero_worker:
-            self.aero_worker.stop_worker()
-        if self.aero_thread:
-            self.aero_thread.quit()
-            self.aero_thread.wait()
-            
-        event.accept()
-
-    def cmd_enable_motors(self):
-        if self.aero_worker:
-            self.aero_worker.enable_axis("X")
-            self.aero_worker.enable_axis("Y")
-            self.aero_worker.enable_axis("Z")
-
-    def cmd_disable_motors(self):
-        if self.aero_worker:
-            self.aero_worker.disable_axis("X")
-            self.aero_worker.disable_axis("Y")
-            self.aero_worker.disable_axis("Z")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
