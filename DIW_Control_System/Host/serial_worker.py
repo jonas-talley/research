@@ -4,8 +4,10 @@ import collections
 import datetime
 import csv
 import os
+import struct
 from PySide6.QtCore import QObject, Signal, QMutex
 from protocol import *
+from config_manager import load_config
 
 class SerialWorker(QObject):
     connected = Signal(str)
@@ -32,7 +34,11 @@ class SerialWorker(QObject):
         self.log_file = None
         self.csv_writer = None
         
-        # Hardware Info (Safe default if parsing fails)
+        # Config
+        self.config = load_config()
+        self.log_folder = self.config.get("defaults", {}).get("log_folder", "logs")
+        
+        # Hardware Info
         self.steps_per_um = CONSTANTS.get('STEPS_PER_UM', 1.0) 
         if self.steps_per_um == 0: self.steps_per_um = 1.0
 
@@ -57,7 +63,6 @@ class SerialWorker(QObject):
                             t_us, p_raw, v_cur, v_tgt, pos_steps, err, fill = TELEM_STRUCT.unpack(data)
                             t_s = t_us / 1e6
                             
-                            # Calculate Real World Position (SSOT)
                             pos_um = pos_steps / self.steps_per_um
 
                             telem_data = {
@@ -66,7 +71,7 @@ class SerialWorker(QObject):
                                 'velocity_cur': v_cur,
                                 'velocity_tgt': v_tgt,
                                 'position_steps': pos_steps,
-                                'position_um': pos_um, # <--- Added
+                                'position_um': pos_um, 
                                 'error': err,
                                 'buffer': fill
                             }
@@ -81,16 +86,17 @@ class SerialWorker(QObject):
                                         f"{p_raw:.2f}", 
                                         f"{v_cur:.2f}", 
                                         f"{v_tgt:.2f}", 
-                                        f"{pos_um:.3f}",   # <--- Logged as Microns
-                                        pos_steps,         # <--- Raw Steps kept for debug
+                                        f"{pos_um:.3f}",   
+                                        pos_steps,         
                                         err
                                     ])
-                                except Exception:
-                                    pass 
+                                except Exception as e:
+                                    self.error_occurred.emit(f"Log Write Error: {str(e)}")
                             self.mutex.unlock()
                             # ---------------
 
-                            if self.streaming_active and fill < 50:
+                            # Aggressive Refill: If buffer < 400, trigger burst
+                            if self.streaming_active and fill < 400:
                                 self.process_stream()
 
                         except struct.error:
@@ -106,26 +112,25 @@ class SerialWorker(QObject):
     def change_log_file(self, filename):
         self.mutex.lock()
         try:
-            if not os.path.exists("logs"):
-                os.makedirs("logs")
+            if not os.path.exists(self.log_folder):
+                os.makedirs(self.log_folder)
             
             if self.log_file:
                 self.log_file.close()
             
-            full_path = os.path.join("logs", filename)
+            full_path = os.path.join(self.log_folder, filename)
             is_new = not os.path.exists(full_path)
             
             self.log_file = open(full_path, 'a', newline='')
             self.csv_writer = csv.writer(self.log_file)
             
             if is_new:
-                # UPDATED HEADER
                 self.csv_writer.writerow([
                     "timestamp_s", 
                     "pressure_kPa", 
                     "velocity_current_um_s", 
                     "velocity_target_um_s", 
-                    "position_um",       # <--- The critical column
+                    "position_um",       
                     "position_steps", 
                     "error_flags"
                 ])
@@ -133,16 +138,22 @@ class SerialWorker(QObject):
             self.log_status_changed.emit(f"Logging to: {filename}")
             
         except Exception as e:
-            self.error_occurred.emit(f"Log Error: {e}")
+            self.error_occurred.emit(f"Log Init Error: {e}")
         finally:
             self.mutex.unlock()
 
-    # ... (Rest of file: process_stream, send_command, queue_stream, disconnect_serial are unchanged)
     def process_stream(self):
         self.mutex.lock()
         if self.move_playlist:
-            vel, dur = self.move_playlist.popleft()
-            self.send_command_internal(CMD_QUEUE_MOVE, vel, dur)
+            # Burst Mode: Send up to 10 packets per loop
+            burst_limit = 10 
+            count = 0
+            
+            while self.move_playlist and count < burst_limit:
+                vel, dur = self.move_playlist.popleft()
+                self.send_command_internal(CMD_QUEUE_MOVE, vel, dur)
+                count += 1
+            
             remaining = len(self.move_playlist)
             self.stream_progress.emit(self.total_moves - remaining, self.total_moves)
         else:
@@ -158,11 +169,28 @@ class SerialWorker(QObject):
             self.ser.write(packet)
 
     def queue_stream(self, moves):
+        """
+        Loads the playlist and PRELOADS the buffer aggressively.
+        """
         self.mutex.lock()
         self.move_playlist = collections.deque(moves)
         self.total_moves = len(moves)
+        
+        # Aggressive Preload: Fill up to 450 slots (safe for 512 size)
+        preload_count = 0
+        preload_limit = 450
+            
+        while self.move_playlist and preload_count < preload_limit:
+            vel, dur = self.move_playlist.popleft()
+            self.send_command_internal(CMD_QUEUE_MOVE, vel, dur)
+            preload_count += 1
+        
+        # Hand off the rest to the worker thread
         self.streaming_active = True
         self.mutex.unlock()
+        
+        # Update progress bar immediately
+        self.stream_progress.emit(preload_count, self.total_moves)
 
     def disconnect_serial(self):
         self.running = False

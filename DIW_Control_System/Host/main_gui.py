@@ -2,19 +2,19 @@ import sys
 import os
 import datetime
 import numpy as np
-import pandas as pd
 import pyqtgraph as pg
 from collections import deque
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QLabel, QLineEdit, QTabWidget, QGroupBox, 
-    QProgressBar, QFileDialog, QMessageBox, QSpinBox
+    QProgressBar, QFileDialog, QMessageBox, QSpinBox, QDoubleSpinBox
 )
 from PySide6.QtCore import Qt, QThread, Slot
 from serial_worker import SerialWorker
 from protocol import *
-import math
 from aerotech import AerotechDriver
+from trajectory_parser import parse_gcode_to_dual_streams, parse_csv_trajectory
+from config_manager import load_config
 
 class DIWController(QMainWindow):
     def __init__(self):
@@ -22,8 +22,15 @@ class DIWController(QMainWindow):
         self.setWindowTitle("DIW Control System - Integrated Mode")
         self.resize(1100, 950) 
 
-        # Config
-        self.port_name = "COM3" 
+        # Load Config
+        self.config = load_config()
+        self.port_name = self.config.get("teensy_port", "COM3")
+        
+        # Config Defaults
+        defaults = self.config.get("defaults", {})
+        self.default_vel = defaults.get("velocity_um_s", 500.0)
+        self.default_steps = defaults.get("move_steps", 1000)
+        
         self.plot_history_size = 500
         
         # Data Storage
@@ -70,7 +77,7 @@ class DIWController(QMainWindow):
         self.setup_manual_tab(self.tab_manual)
         tabs.addTab(self.tab_manual, "Manual Control")
 
-        # Tab 2: Smart Streamer (Replaces CSV & GCode tabs)
+        # Tab 2: Smart Streamer
         self.tab_stream = QWidget()
         self.setup_stream_tab(self.tab_stream)
         tabs.addTab(self.tab_stream, "Trajectory Streamer")
@@ -89,12 +96,18 @@ class DIWController(QMainWindow):
         # A. Velocity Control
         grp_vel = QGroupBox("1. Velocity Control (Jog)")
         vel_layout = QHBoxLayout()
-        self.txt_velocity = QLineEdit("500")
-        self.txt_velocity.setPlaceholderText("Velocity (um/s)")
+        
+        self.spin_velocity = QDoubleSpinBox()
+        self.spin_velocity.setRange(0.0, 5000.0)
+        self.spin_velocity.setValue(self.default_vel)
+        self.spin_velocity.setSuffix(" um/s")
+        self.spin_velocity.setSingleStep(50.0)
+        
         btn_set = QPushButton("Run Constant Velocity")
         btn_set.clicked.connect(self.cmd_set_velocity)
-        vel_layout.addWidget(QLabel("Speed (um/s):"))
-        vel_layout.addWidget(self.txt_velocity)
+        
+        vel_layout.addWidget(QLabel("Speed:"))
+        vel_layout.addWidget(self.spin_velocity)
         vel_layout.addWidget(btn_set)
         grp_vel.setLayout(vel_layout)
         layout.addWidget(grp_vel)
@@ -103,8 +116,11 @@ class DIWController(QMainWindow):
         grp_pos = QGroupBox("2. Step Control (Move Relative)")
         pos_layout = QHBoxLayout()
         
-        self.txt_steps = QLineEdit("1000")
-        self.txt_steps.setPlaceholderText("Steps")
+        self.spin_steps = QSpinBox()
+        self.spin_steps.setRange(1, 1000000)
+        self.spin_steps.setValue(self.default_steps)
+        self.spin_steps.setSuffix(" steps")
+        self.spin_steps.setSingleStep(100)
         
         btn_move_p = QPushButton("Move (+)")
         btn_move_p.clicked.connect(lambda: self.cmd_move_relative(1))
@@ -116,8 +132,8 @@ class DIWController(QMainWindow):
         btn_zero.setStyleSheet("background-color: #DDD;")
         btn_zero.clicked.connect(lambda: self.worker.send_command(CMD_ZERO_POSITION))
 
-        pos_layout.addWidget(QLabel("Distance (Steps):"))
-        pos_layout.addWidget(self.txt_steps)
+        pos_layout.addWidget(QLabel("Distance:"))
+        pos_layout.addWidget(self.spin_steps)
         pos_layout.addWidget(btn_move_p)
         pos_layout.addWidget(btn_move_n)
         pos_layout.addWidget(btn_zero)
@@ -174,8 +190,8 @@ class DIWController(QMainWindow):
         layout.addWidget(self.prog_stream)
         
         self.prog_buffer = QProgressBar()
-        self.prog_buffer.setRange(0, 64)
-        self.prog_buffer.setFormat("Hardware Buffer: %v / 64")
+        self.prog_buffer.setRange(0, 512)
+        self.prog_buffer.setFormat("Hardware Buffer: %v / 512")
         layout.addWidget(self.prog_buffer)
         layout.addStretch()
 
@@ -262,11 +278,11 @@ class DIWController(QMainWindow):
         self.worker.connected.connect(lambda p: self.lbl_status.setText(f"Connected: {p}"))
         self.worker.stream_progress.connect(self.prog_stream.setValue)
         self.worker.log_status_changed.connect(self.lbl_log_status.setText)
+        self.worker.error_occurred.connect(lambda e: QMessageBox.warning(self, "Error", e)) 
         
         self.thread.start()
 
     def load_file(self):
-        """Smart loader that handles both CSV and GCode"""
         fname, _ = QFileDialog.getOpenFileName(self, "Open File", "", "Files (*.csv *.gcode *.nc *.txt)")
         if not fname: return
 
@@ -276,23 +292,13 @@ class DIWController(QMainWindow):
         QApplication.processEvents()
 
         try:
-            # Mode 1: CSV (Teensy Only)
             if ext == '.csv':
-                self.pending_pgm = None # Disable Aerotech Logic
-                df = pd.read_csv(fname)
-                times = df['Time'].values
-                vels = df['Velocity'].values
-                moves = []
-                for i in range(len(times)-1):
-                    dt = (times[i+1] - times[i]) * 1000.0
-                    if dt > 0: moves.append((float(vels[i]), float(dt)))
-                
-                self.pending_moves = moves
-                self.lbl_filename.setText(f"{os.path.basename(fname)} [CSV: {len(moves)} pts]")
+                self.pending_pgm = None 
+                self.pending_moves = parse_csv_trajectory(fname)
+                self.lbl_filename.setText(f"{os.path.basename(fname)} [CSV: {len(self.pending_moves)} pts]")
             
-            # Mode 2: G-Code (Dual Stream)
             elif ext in ['.gcode', '.nc', '.txt']:
-                pgm_lines, teensy_moves = self.parse_gcode_to_dual_streams(fname)
+                pgm_lines, teensy_moves = parse_gcode_to_dual_streams(fname)
                 self.pending_pgm = pgm_lines
                 self.pending_moves = teensy_moves
                 self.lbl_filename.setText(f"{os.path.basename(fname)} [G-Code: {len(teensy_moves)} moves]")
@@ -304,86 +310,30 @@ class DIWController(QMainWindow):
             self.lbl_filename.setText("Error loading file")
             QMessageBox.critical(self, "Load Error", str(e))
 
-    def parse_gcode_to_dual_streams(self, gcode_filepath):
-        aerotech_lines = [
-            "ENABLE X",
-            "ENABLE Y",
-            "ENABLE Z",
-            "INCREMENTAL",
-            "METRIC", 
-            "VELOCITY ON", 
-            "WAIT MODE AUTO"
-        ]
-        
-        teensy_moves = []
-        last_f_rate = 1.0 
-        
-        with open(gcode_filepath, 'r') as f:
-            lines = f.readlines()
-
-        for line in lines:
-            line = line.strip().upper()
-            if not line or line.startswith(';') or line.startswith('('): 
-                continue
-            
-            if line.startswith('G1'):
-                dx, dy, dz, de = 0.0, 0.0, 0.0, 0.0
-                current_f = None
-                
-                parts = line.split()
-                for p in parts:
-                    if p.startswith('X'): dx = float(p[1:])
-                    if p.startswith('Y'): dy = float(p[1:])
-                    if p.startswith('Z'): dz = float(p[1:])
-                    if p.startswith('E'): de = float(p[1:])
-                    if p.startswith('F'): current_f = float(p[1:])
-                
-                if current_f is not None:
-                    last_f_rate = current_f
-                
-                # Geometry & Timing
-                distance = math.sqrt(dx**2 + dy**2 + dz**2)
-                if distance <= 0.0001: continue
-
-                # Duration in Seconds
-                duration_sec = distance / last_f_rate 
-                
-                # 1. Aerotech Command
-                aero_cmd = f"G1 X{dx:.4f} Y{dy:.4f} Z{dz:.4f} F{last_f_rate:.4f}"
-                aerotech_lines.append(aero_cmd)
-                
-
-                
-                # Convert to ms for Protocol
-                duration_ms = duration_sec * 1000.0
-                
-                teensy_moves.append((de, duration_ms))
-
-        aerotech_lines.append("END PROGRAM")
-        return aerotech_lines, teensy_moves
-
     def start_streaming(self):
         if not self.pending_moves:
             return
 
         print("Starting execution sequence...")
-
-        # 1. Handle Aerotech (If G-Code mode)
+        
+        # 1. Clear Old Buffer (Fixes the "System Locked" issue)
+        self.worker.send_command(CMD_CLEAR_QUEUE)
+        
+        # 2. Arm Teensy (Now includes Pre-load)
+        # This will fill the first 32 buffer slots immediately
+        self.worker.queue_stream(self.pending_moves)
+        
+        # 3. Prepare Aerotech (If G-Code mode)
+        driver = None
+        pgm_filename = "diw_job.pgm"
+        
         if self.pending_pgm:
-            pgm_filename = "diw_job.pgm"
             driver = AerotechDriver() 
             save_path = os.path.join(driver.user_files_path, pgm_filename)
-            
-            # Directory Safety Check
             folder_path = os.path.dirname(save_path)
             if not os.path.exists(folder_path):
-                try:
-                    os.makedirs(folder_path, exist_ok=True)
-                except Exception as e:
-                    QMessageBox.critical(self, "System Error", f"Cannot create Aerotech folder: {e}")
-                    return
+                os.makedirs(folder_path, exist_ok=True)
 
-            # Write PGM
             try:
                 with open(save_path, "w") as f:
                     f.write("\n".join(self.pending_pgm))
@@ -391,27 +341,29 @@ class DIWController(QMainWindow):
                 QMessageBox.critical(self, "Write Error", f"Failed to save PGM file: {e}")
                 return
 
-            # Trigger Stage Motion
-            # We queue the Teensy FIRST so it's ready the instant the stage moves
-            print("Uploading to Stage...")
+        # 4. FIRE (Synchronized Start)
+        print("Sending FIRE command to Teensy...")
+        # Because we pre-loaded, the buffer is guaranteed not empty.
+        self.worker.send_command(CMD_START_QUEUE) 
+
+        if driver and self.pending_pgm:
+            print("Triggering Stage Motion...")
             success, msg = driver.run_pgm(pgm_filename)
             if not success:
                 QMessageBox.critical(self, "Stage Error", f"Aerotech refused start: {msg}")
+                self.worker.send_command(CMD_EMERGENCY_STOP) 
                 return
             print("Stage Started.")
-
-        # 2. Start Teensy (Common to both modes)
-        # This will start feeding the buffer immediately.
-        # If manual CSV, it just runs. If G-Code, it runs in sync with the file we just triggered.
-        self.worker.queue_stream(self.pending_moves)
-        print("Teensy Stream Started.")
+        
+        print("Stream Active.")
 
     def abort_stream(self):
         # 1. Stop Teensy
         self.worker.queue_stream([])
         self.worker.send_command(CMD_CLEAR_QUEUE)
+        self.worker.send_command(CMD_EMERGENCY_STOP)
         
-        # 2. Stop Aerotech (Blind Abort)
+        # 2. Stop Aerotech
         if self.pending_pgm:
             try:
                 driver = AerotechDriver()
@@ -420,20 +372,14 @@ class DIWController(QMainWindow):
                 pass
 
     def cmd_set_velocity(self):
-        try:
-            val = float(self.txt_velocity.text())
-            self.worker.send_command(CMD_SET_VELOCITY, val_a=val)
-        except ValueError:
-            pass
+        val = self.spin_velocity.value()
+        self.worker.send_command(CMD_SET_VELOCITY, val_a=val)
 
     def cmd_move_relative(self, direction):
-        try:
-            steps = int(self.txt_steps.text()) * direction
-            speed = float(self.txt_velocity.text())
-            if speed <= 0: speed = 500.0
-            self.worker.send_command(CMD_MOVE_RELATIVE, val_a=steps, val_b=speed)
-        except ValueError:
-            pass
+        steps = self.spin_steps.value() * direction
+        speed = self.spin_velocity.value()
+        if speed <= 0: speed = 500.0
+        self.worker.send_command(CMD_MOVE_RELATIVE, val_a=steps, val_b=speed)
 
     def cmd_stop(self):
         self.worker.send_command(CMD_SET_VELOCITY, val_a=0.0)
