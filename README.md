@@ -28,7 +28,8 @@ TODO:
     Improve options for plotting
     Perform better stress-tests on system
     Implement teensy ping protocol to prevent continued motion if gui crashes
-
+    
+```
 DIW_Control_System/
 ├── Firmware/                  # Teensy 4.1 Motion Control Code
 │   ├── src/
@@ -49,3 +50,4 @@ DIW_Control_System/
 │
 └── Shared/                    # Common Definitions
     └── protocol_constants.h   # "Source of Truth": OpCodes and Packet Structs used by C++ and Python
+```
