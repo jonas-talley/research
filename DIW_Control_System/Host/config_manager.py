@@ -3,6 +3,7 @@ import os
 
 CONFIG_FILE = "config.json"
 
+#DO NOT Change these defaults, particularly aerotech things unless you are getting pretty deep in the weeds.
 DEFAULT_CONFIG = {
     "aerotech_ip": "127.0.0.1",
     "aerotech_port": 8000,

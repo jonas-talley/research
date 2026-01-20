@@ -319,8 +319,8 @@ class DIWController(QMainWindow):
         # 1. Clear Old Buffer (Fixes the "System Locked" issue)
         self.worker.send_command(CMD_CLEAR_QUEUE)
         
-        # 2. Arm Teensy (Now includes Pre-load)
-        # This will fill the first 32 buffer slots immediately
+        # 2. Pre-load the teensy
+        # This will fill the first like 400 buffer slots immediately
         self.worker.queue_stream(self.pending_moves)
         
         # 3. Prepare Aerotech (If G-Code mode)
@@ -349,7 +349,7 @@ class DIWController(QMainWindow):
         if driver and self.pending_pgm:
             print("Triggering Stage Motion...")
             success, msg = driver.run_pgm(pgm_filename)
-            if not success:
+            if not success: #I have never seen this case activate, unsure if it would trigger.
                 QMessageBox.critical(self, "Stage Error", f"Aerotech refused start: {msg}")
                 self.worker.send_command(CMD_EMERGENCY_STOP) 
                 return

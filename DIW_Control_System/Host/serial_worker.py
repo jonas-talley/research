@@ -16,7 +16,7 @@ class SerialWorker(QObject):
     error_occurred = Signal(str)
     stream_progress = Signal(int, int)
     log_status_changed = Signal(str)
-    finished = Signal() # <--- NEW: Signals thread it is safe to quit
+    finished = Signal()
 
     def __init__(self, port):
         super().__init__()
@@ -30,7 +30,7 @@ class SerialWorker(QObject):
         self.streaming_active = False
         self.waiting_for_buffer_sync = False
         
-        # Thread-Safety
+        # Thread-Safety, some form of interrupt lock is important on the serial port
         self.mutex = QRecursiveMutex()
         
         # Logging
@@ -92,7 +92,7 @@ class SerialWorker(QObject):
                 finally:
                     self.mutex.unlock() 
 
-                # --- 2. Logic (Unlocked) ---
+                # --- 2. Logic ---
                 if data_found and telem_data:
                     self.telemetry_received.emit(telem_data)
 

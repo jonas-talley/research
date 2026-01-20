@@ -7,6 +7,7 @@ def parse_csv_trajectory(fname):
     Parses a CSV file for Teensy-only extrusion.
     Expected columns: 'Time', 'Velocity'
     Returns: list of (velocity, duration_ms) tuples
+    Maximum frequency of velocity updates: ~500Hz
     """
     df = pd.read_csv(fname)
     # Ensure columns exist (basic check)
@@ -29,6 +30,13 @@ def parse_gcode_to_dual_streams(gcode_filepath):
     Parses G-Code into:
     1. Aerotech program lines (List[str])
     2. Teensy extrusion moves (List[(velocity, duration_ms)])
+
+    Only parses lines that start with G1. All aerotech XYZ is incremental in mm. F is mm/s. E is absolute micron/s for stepper.
+    All aerotech files have header of:         
+        "ENABLE X", "ENABLE Y", "ENABLE Z",
+        "INCREMENTAL", "METRIC", 
+        "VELOCITY ON", 
+        "WAIT MODE AUTO"
     """
     aerotech_lines = [
         "ENABLE X", "ENABLE Y", "ENABLE Z",

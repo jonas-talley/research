@@ -5,12 +5,12 @@ from config_manager import load_config
 class AerotechDriver:
     def __init__(self):
         config = load_config()
-        self.ip = config.get("aerotech_ip", "127.0.0.1")
-        self.port = config.get("aerotech_port", 8000)
-        self.user_files_path = config.get("aerotech_path", r"C:\Users\Public\Public Documents\Aerotech\A3200\User Files")
+        self.ip = config.get("aerotech_ip", "127.0.0.1") #Built-in aerotech IP
+        self.port = config.get("aerotech_port", 8000) #Configured port in the configuration manager program on PC
+        self.user_files_path = config.get("aerotech_path", r"C:\Users\Public\Public Documents\Aerotech\A3200\User Files") #Default path on that pc for where the aerotech default folder is.
 
     def _send(self, cmd):
-        """Internal single-shot sender with no persistent connection hang-ups"""
+        """Internal send an ascii command to the aerotech controller ascii interface"""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(2)
@@ -30,7 +30,7 @@ class AerotechDriver:
         response = self._send(cmd)
         
         if response == "#":
-            # If failed, return the server error reason
+            # If failed, return the error reason
             return False, self._send("~LASTERROR")
         return True, response
 
