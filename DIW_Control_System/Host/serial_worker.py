@@ -5,7 +5,7 @@ import datetime
 import csv
 import os
 import struct
-from PySide6.QtCore import QObject, Signal, QMutex
+from PySide6.QtCore import QObject, Signal, QRecursiveMutex, QMutex
 from protocol import *
 from config_manager import load_config
 
@@ -16,6 +16,7 @@ class SerialWorker(QObject):
     error_occurred = Signal(str)
     stream_progress = Signal(int, int)
     log_status_changed = Signal(str)
+    finished = Signal() # <--- NEW: Signals thread it is safe to quit
 
     def __init__(self, port):
         super().__init__()
@@ -27,7 +28,10 @@ class SerialWorker(QObject):
         self.move_playlist = collections.deque()
         self.total_moves = 0
         self.streaming_active = False
-        self.mutex = QMutex()
+        self.waiting_for_buffer_sync = False
+        
+        # Thread-Safety
+        self.mutex = QRecursiveMutex()
         
         # Logging
         self.logging_enabled = True
@@ -43,71 +47,100 @@ class SerialWorker(QObject):
         if self.steps_per_um == 0: self.steps_per_um = 1.0
 
     def run(self):
+        """Main Loop - Runs in Worker Thread"""
         try:
             self.ser = serial.Serial(self.port, 115200, timeout=0.01)
             self.ser.reset_input_buffer()
             self.running = True
             
-            # Start Default Log
             default_name = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             self.change_log_file(default_name)
             
             self.connected.emit(self.port)
 
             while self.running:
-                if self.ser.in_waiting >= TELEM_STRUCT.size:
-                    data = self.ser.read(TELEM_STRUCT.size)
-                    if len(data) == TELEM_STRUCT.size:
+                # --- 1. Serial Access (Locked) ---
+                self.mutex.lock()
+                data_found = False
+                telem_data = None
+                fill = 512
+                
+                try:
+                    if self.ser and self.ser.is_open and self.ser.in_waiting >= TELEM_STRUCT.size:
+                        data = self.ser.read(TELEM_STRUCT.size)
+                        if len(data) == TELEM_STRUCT.size:
+                            try:
+                                t_us, p_raw, v_cur, v_tgt, pos_steps, err, fill = TELEM_STRUCT.unpack(data)
+                                t_s = t_us / 1e6
+                                pos_um = pos_steps / self.steps_per_um
+
+                                telem_data = {
+                                    'time': t_s,
+                                    'pressure': p_raw,
+                                    'velocity_cur': v_cur,
+                                    'velocity_tgt': v_tgt,
+                                    'position_steps': pos_steps,
+                                    'position_um': pos_um, 
+                                    'error': err,
+                                    'buffer': fill
+                                }
+                                data_found = True
+                            except struct.error:
+                                pass
+                except Exception as e:
+                    self.error_occurred.emit(str(e))
+                finally:
+                    self.mutex.unlock() 
+
+                # --- 2. Logic (Unlocked) ---
+                if data_found and telem_data:
+                    self.telemetry_received.emit(telem_data)
+
+                    # Log Data (Requires Lock for File I/O)
+                    self.mutex.lock()
+                    if self.logging_enabled and self.csv_writer:
                         try:
-                            # Unpack
-                            t_us, p_raw, v_cur, v_tgt, pos_steps, err, fill = TELEM_STRUCT.unpack(data)
-                            t_s = t_us / 1e6
-                            
-                            pos_um = pos_steps / self.steps_per_um
-
-                            telem_data = {
-                                'time': t_s,
-                                'pressure': p_raw,
-                                'velocity_cur': v_cur,
-                                'velocity_tgt': v_tgt,
-                                'position_steps': pos_steps,
-                                'position_um': pos_um, 
-                                'error': err,
-                                'buffer': fill
-                            }
-                            self.telemetry_received.emit(telem_data)
-
-                            # --- LOGGING ---
-                            self.mutex.lock()
-                            if self.logging_enabled and self.csv_writer:
-                                try:
-                                    self.csv_writer.writerow([
-                                        f"{t_s:.4f}", 
-                                        f"{p_raw:.2f}", 
-                                        f"{v_cur:.2f}", 
-                                        f"{v_tgt:.2f}", 
-                                        f"{pos_um:.3f}",   
-                                        pos_steps,         
-                                        err
-                                    ])
-                                except Exception as e:
-                                    self.error_occurred.emit(f"Log Write Error: {str(e)}")
-                            self.mutex.unlock()
-                            # ---------------
-
-                            # Aggressive Refill: If buffer < 400, trigger burst
-                            if self.streaming_active and fill < 400:
-                                self.process_stream()
-
-                        except struct.error:
-                            pass 
+                            self.csv_writer.writerow([
+                                f"{telem_data['time']:.4f}", 
+                                f"{telem_data['pressure']:.2f}", 
+                                f"{telem_data['velocity_cur']:.2f}", 
+                                f"{telem_data['velocity_tgt']:.2f}", 
+                                f"{telem_data['position_um']:.3f}",   
+                                telem_data['position_steps'],         
+                                telem_data['error']
+                            ])
+                        except Exception:
+                            pass
+                    
+                    # Sync Check
+                    if self.waiting_for_buffer_sync:
+                        if fill > 10 or fill >= self.total_moves:
+                            self.waiting_for_buffer_sync = False
+                    
+                    # Refill
+                    if self.streaming_active and not self.waiting_for_buffer_sync and fill < 400:
+                        self.process_stream_internal() # Use internal unlocked version
+                        
+                    self.mutex.unlock()
 
                 time.sleep(0.001) 
 
         except Exception as e:
-            self.error_occurred.emit(str(e))
+            self.error_occurred.emit(f"Fatal Serial Error: {str(e)}")
         finally:
-            self.disconnect_serial()
+            # --- SAFE SHUTDOWN (In Worker Thread) ---
+            self.mutex.lock()
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+            if self.log_file:
+                self.log_file.close()
+            self.mutex.unlock()
+            self.disconnected.emit()
+            self.finished.emit() # Signal to GUI we are done
+
+    def stop(self):
+        """Thread-safe stop signal. Called from Main Thread."""
+        self.running = False
 
     def change_log_file(self, filename):
         self.mutex.lock()
@@ -119,86 +152,59 @@ class SerialWorker(QObject):
                 self.log_file.close()
             
             full_path = os.path.join(self.log_folder, filename)
-            is_new = not os.path.exists(full_path)
-            
             self.log_file = open(full_path, 'a', newline='')
             self.csv_writer = csv.writer(self.log_file)
-            
-            if is_new:
-                self.csv_writer.writerow([
-                    "timestamp_s", 
-                    "pressure_kPa", 
-                    "velocity_current_um_s", 
-                    "velocity_target_um_s", 
-                    "position_um",       
-                    "position_steps", 
-                    "error_flags"
-                ])
-            
+            self.csv_writer.writerow(["timestamp_s", "pressure_kPa", "velocity_cur", "velocity_tgt", "pos_um", "pos_steps", "error"])
             self.log_status_changed.emit(f"Logging to: {filename}")
-            
         except Exception as e:
             self.error_occurred.emit(f"Log Init Error: {e}")
         finally:
             self.mutex.unlock()
 
-    def process_stream(self):
-        self.mutex.lock()
+    def process_stream_internal(self):
+        """Internal Helper: Assumes Mutex is already locked."""
         if self.move_playlist:
-            # Burst Mode: Send up to 10 packets per loop
             burst_limit = 10 
             count = 0
-            
             while self.move_playlist and count < burst_limit:
                 vel, dur = self.move_playlist.popleft()
-                self.send_command_internal(CMD_QUEUE_MOVE, vel, dur)
+                self.send_packet_locked(CMD_QUEUE_MOVE, vel, dur)
                 count += 1
-            
             remaining = len(self.move_playlist)
             self.stream_progress.emit(self.total_moves - remaining, self.total_moves)
         else:
             self.streaming_active = False
-        self.mutex.unlock()
 
     def send_command(self, opcode, val_a=0.0, val_b=0.0):
-        self.send_command_internal(opcode, val_a, val_b)
+        self.mutex.lock()
+        try:
+            self.send_packet_locked(opcode, val_a, val_b)
+        finally:
+            self.mutex.unlock()
 
-    def send_command_internal(self, opcode, val_a, val_b):
+    def send_packet_locked(self, opcode, val_a, val_b):
+        """Internal Helper: Assumes Mutex is already locked."""
         if self.ser and self.ser.is_open:
             packet = create_packet(opcode, val_a, val_b)
             self.ser.write(packet)
 
     def queue_stream(self, moves):
-        """
-        Loads the playlist and PRELOADS the buffer aggressively.
-        """
         self.mutex.lock()
-        self.move_playlist = collections.deque(moves)
-        self.total_moves = len(moves)
-        
-        # Aggressive Preload: Fill up to 450 slots (safe for 512 size)
-        preload_count = 0
-        preload_limit = 450
+        try:
+            self.move_playlist = collections.deque(moves)
+            self.total_moves = len(moves)
             
-        while self.move_playlist and preload_count < preload_limit:
-            vel, dur = self.move_playlist.popleft()
-            self.send_command_internal(CMD_QUEUE_MOVE, vel, dur)
-            preload_count += 1
-        
-        # Hand off the rest to the worker thread
-        self.streaming_active = True
-        self.mutex.unlock()
-        
-        # Update progress bar immediately
-        self.stream_progress.emit(preload_count, self.total_moves)
-
-    def disconnect_serial(self):
-        self.running = False
-        self.mutex.lock()
-        if self.ser:
-            self.ser.close()
-        if self.log_file:
-            self.log_file.close()
-            self.log_file = None
-        self.mutex.unlock()
-        self.disconnected.emit()
+            preload_count = 0
+            preload_limit = 450
+            while self.move_playlist and preload_count < preload_limit:
+                vel, dur = self.move_playlist.popleft()
+                self.send_packet_locked(CMD_QUEUE_MOVE, vel, dur)
+                preload_count += 1
+            
+            self.streaming_active = True
+            if preload_count > 0:
+                self.waiting_for_buffer_sync = True
+            
+            self.stream_progress.emit(preload_count, self.total_moves)
+        finally:
+            self.mutex.unlock()

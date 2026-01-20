@@ -98,7 +98,7 @@ class DIWController(QMainWindow):
         vel_layout = QHBoxLayout()
         
         self.spin_velocity = QDoubleSpinBox()
-        self.spin_velocity.setRange(0.0, 5000.0)
+        self.spin_velocity.setRange(-5000.0, 5000.0)
         self.spin_velocity.setValue(self.default_vel)
         self.spin_velocity.setSuffix(" um/s")
         self.spin_velocity.setSingleStep(50.0)
@@ -419,10 +419,15 @@ class DIWController(QMainWindow):
                 pass 
 
     def closeEvent(self, event):
-        self.worker.disconnect_serial()
-        self.thread.quit()
-        self.thread.wait()
-        event.accept()
+            # STOP the worker safely
+            if self.worker:
+                self.worker.stop()
+                # Wait for thread to finish (Max 1 sec to prevent hanging)
+                if self.thread.isRunning():
+                    self.thread.quit()
+                    self.thread.wait(1000) 
+            
+            event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
