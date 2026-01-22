@@ -1,35 +1,43 @@
-The DIW_Control_System codebase is the entire package used for control and communications for the printer.
+# DIW Control System
 
-Currently, the printer has a few key "modes"
-Velocity Control:
-    A set velocity is set to the stepper motor in microns/second, goes until manual stop or a velocity change
-Step Control:
-    Manually jog a set number of steps at safe speed.
-CSV Control:
-    A CSV with the columns Time and Velocity is imported. Maximum frequency ~500Hz for new velocities.
-GCode control:
-    A .gcode or .nc file with very custom instructions can be imported, which will coordinate both the aerotech stage and the piston.
-        All X Y Z values are incremental
-        All F Values are mm/s
-        All E values are absolute microns/s to move the plunger
-        Axes should be enabled, probably homed, and located at start of print
-        Coordinated system might not catch aerotech errors, treat like full open-loop motion.
+The **DIW_Control_System** codebase is the entire package used for control and communications for the printer.
 
-General Information:
--   If the teensy is active (see heartbeat LED), it will immediately stop piston motion BEFORE pressure goes critical.
--   If the GUI process crashes while a uploaded profile or velocity is given, in the past the teensy has continued
--   The Aerotech coordination utilizes a relatively complex system of writing a file from the parsed gcode, and then telling the aerotech controller to run it using the ascii interface. This is necessary because Aerotech is running 32-bit, but our python version is 64-bit, so the .dll files cannot talk for the .NET library implementation.
--   Recommended environment is python3.14, currently the pc is using pixi as a python manager. Platformio is necessary for building and flashing the teensy.
+Currently, the printer has a few key "modes":
 
-TODO:
-    Implement mode for relating bulk modulus and past data to reduce flowrate change transience
-    Fix potential race conditions on buffer fill for CSV/Gcode velocity events
-    Improve GUI consistency on colors and button placement
-    Improve options for plotting
-    Perform better stress-tests on system
-    Implement teensy ping protocol to prevent continued motion if gui crashes
-    
-```
+* **Velocity Control:**
+  A set velocity is set to the stepper motor in microns/second, goes until manual stop or a velocity change.
+
+* **Step Control:**
+  Manually jog a set number of steps at safe speed.
+
+* **CSV Control:**
+  A CSV with the columns `Time` and `Velocity` is imported. Maximum frequency ~500Hz for new velocities.
+
+* **GCode Control:**
+  A `.gcode` or `.nc` file with very custom instructions can be imported, which will coordinate both the Aerotech stage and the piston.
+  * All X, Y, Z values are incremental.
+  * All F Values are mm/s.
+  * All E values are absolute microns/s to move the plunger.
+  * Axes should be enabled, probably homed, and located at start of print.
+  * Coordinated system might not catch Aerotech errors, treat like full open-loop motion.
+
+### General Information
+
+* If the teensy is active (see heartbeat LED), it will immediately stop piston motion **BEFORE** pressure goes critical.
+* If the GUI process crashes while a uploaded profile or velocity is given, in the past the teensy has continued.
+* The Aerotech coordination utilizes a relatively complex system of writing a file from the parsed gcode, and then telling the Aerotech controller to run it using the ascii interface. This is necessary because Aerotech is running 32-bit, but our python version is 64-bit, so the .dll files cannot talk for the .NET library implementation.
+* Recommended environment is python3.14, currently the pc is using pixi as a python manager. Platformio is necessary for building and flashing the teensy.
+
+### TODO
+
+- [ ] Implement mode for relating bulk modulus and past data to reduce flowrate change transience
+- [ ] Fix potential race conditions on buffer fill for CSV/Gcode velocity events
+- [ ] Improve GUI consistency on colors and button placement
+- [ ] Improve options for plotting
+- [ ] Perform better stress-tests on system
+- [ ] Implement teensy ping protocol to prevent continued motion if gui crashes
+
+```text
 DIW_Control_System/
 ├── Firmware/                  # Teensy 4.1 Motion Control Code
 │   ├── src/
