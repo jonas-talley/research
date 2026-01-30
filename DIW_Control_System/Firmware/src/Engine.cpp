@@ -1,8 +1,8 @@
 #include "Engine.h"
 #include <IntervalTimer.h>
-#include "Watchdog_t4.h" // Teensy 4.x Watchdog Library, can be obtained at https://github.com/tonton81/WDT_T4
+#include "Watchdog_t4.h" // Teensy 4.x Watchdog Library
 
-// --- Globals ---
+// --- Globals (Encapsulated in cpp) ---
 IntervalTimer controlTimer;
 IntervalTimer stepTimer;
 WDT_T4<WDT1> wdt;
@@ -55,12 +55,14 @@ void Engine::setup() {
     pinMode(PIN_ENABLE, OUTPUT);
     pinMode(PIN_PRESSURE, INPUT);
     
+    // RESTORED: Onboard LED
     pinMode(LED_BUILTIN, OUTPUT);
     
     analogReadResolution(10);
     
-    digitalWriteFast(PIN_ENABLE, HIGH);
+    digitalWriteFast(PIN_ENABLE, HIGH); // Disable init
 
+    // Watchdog Config
     WDT_timings_t config;
     config.trigger = 1; // ms
     config.timeout = WDT_TIMEOUT_MS; // ms
@@ -84,8 +86,7 @@ void Engine::run() {
     static uint32_t last_led_toggle = 0;
     static bool led_state = false;
     uint32_t now = millis();
-    uint32_t interval = 2000;
-
+    uint32_t interval = 2000; // Default: Idle (Slow Heartbeat)
 
     if (is_queue_running || current_mode == MODE_VELOCITY || current_mode == MODE_POSITION) {
         interval = 1000; // Active: Fast Blink
@@ -101,7 +102,6 @@ void Engine::run() {
 }
 
 // --- COMMANDS ---
-
 void Engine::set_velocity(float vel_um_s) {
     current_mode = MODE_VELOCITY;
     is_queue_running = false;
@@ -186,6 +186,7 @@ TelemetryPacket Engine::get_telemetry() {
     t.total_steps = global_position_steps;
     t.error_flags = system_error_flags;
     
+    // Explicit cast, though uint16 to uint16 is safe
     t.buffer_fill = queue_count; 
     
     interrupts();
@@ -257,7 +258,7 @@ void Engine::control_loop_isr() {
         if (current_velocity_um_s < target_velocity_um_s) current_velocity_um_s = target_velocity_um_s;
     }
 
-    if (abs(current_velocity_um_s) < 0.1f) {
+    if (abs(current_velocity_um_s) < 0.001f) {
         stepTimer.end();
         last_step_period_us = 0;
     } else {
@@ -268,7 +269,12 @@ void Engine::control_loop_isr() {
         uint32_t period_us = (uint32_t)(1000000.0f / freq);
         
         if (abs((int)period_us - (int)last_step_period_us) > 2) {
-            stepTimer.begin(step_timer_isr, period_us);
+            if(last_step_period_us == 0) {
+                stepTimer.begin(step_timer_isr, period_us);
+            }
+            else {
+                stepTimer.update(period_us);
+            }
             last_step_period_us = period_us;
         }
     }
