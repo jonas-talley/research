@@ -9,16 +9,12 @@
 #define PIN_PRESSURE    27
 
 // --- Calibration ---
-
-//Following values calibrated using ESI tool.
 #define PRESSURE_CALIBRATION_FACTOR  1.568818661410291f
 #define PRESSURE_OFFSET             -14.882802381988625f
-#define MAX_PRESSURE_LIMIT           1550.0f //kPa
+#define MAX_PRESSURE_LIMIT           1550.0f 
 
-//Calibrated using LVDT
-#define STEPS_PER_UM                 16.1024f
+#define STEPS_PER_UM                 4.351835f
 
-//Anything below this pulse width and the motor driver will lose the steps
 #define MOTOR_PULSE_WIDTH_NS         3000 
 
 // Watchdog Timeout (ms)

@@ -16,7 +16,7 @@ class SerialWorker(QObject):
     error_occurred = Signal(str)
     stream_progress = Signal(int, int)
     log_status_changed = Signal(str)
-    finished = Signal()
+    finished = Signal() # <--- NEW: Signals thread it is safe to quit
 
     def __init__(self, port):
         super().__init__()
@@ -30,7 +30,7 @@ class SerialWorker(QObject):
         self.streaming_active = False
         self.waiting_for_buffer_sync = False
         
-        # Thread-Safety, some form of interrupt lock is important on the serial port
+        # Thread-Safety
         self.mutex = QRecursiveMutex()
         
         # Logging
@@ -92,7 +92,7 @@ class SerialWorker(QObject):
                 finally:
                     self.mutex.unlock() 
 
-                # --- 2. Logic ---
+                # --- 2. Logic (Unlocked) ---
                 if data_found and telem_data:
                     self.telemetry_received.emit(telem_data)
 
@@ -101,12 +101,12 @@ class SerialWorker(QObject):
                     if self.logging_enabled and self.csv_writer:
                         try:
                             self.csv_writer.writerow([
-                                f"{telem_data['time']:.4f}", 
+                                f"{telem_data['time']*1000.0:.1f}", 
                                 f"{telem_data['pressure']:.2f}", 
+                                telem_data['position_steps'],         
                                 f"{telem_data['velocity_cur']:.2f}", 
                                 f"{telem_data['velocity_tgt']:.2f}", 
                                 f"{telem_data['position_um']:.3f}",   
-                                telem_data['position_steps'],         
                                 telem_data['error']
                             ])
                         except Exception:
@@ -154,7 +154,7 @@ class SerialWorker(QObject):
             full_path = os.path.join(self.log_folder, filename)
             self.log_file = open(full_path, 'a', newline='')
             self.csv_writer = csv.writer(self.log_file)
-            self.csv_writer.writerow(["timestamp_s", "pressure_kPa", "velocity_cur", "velocity_tgt", "pos_um", "pos_steps", "error"])
+            self.csv_writer.writerow(["timestamp_ms", "pressure_kPa", "total_steps", "velocity_cur", "velocity_tgt", "pos_um", "error"])
             self.log_status_changed.emit(f"Logging to: {filename}")
         except Exception as e:
             self.error_occurred.emit(f"Log Init Error: {e}")

@@ -3,12 +3,12 @@
 #include "protocol_constants.h"
 
 void setup() {
-    Serial.begin(115200); //Serial transfer rate
+    Serial.begin(115200);
     Engine::setup();
 }
 
 void loop() {
-    Engine::run();
+    Engine::run(); // Watchdog feed & safety
 
     // --- 1. Serial Command Parsing ---
     while (Serial.available() >= sizeof(ControlPacket)) {
@@ -32,7 +32,7 @@ void loop() {
                     break;
 
                 case CMD_START_QUEUE:
-                    Engine::start_queue();
+                    Engine::start_queue(); // FIRE!
                     break;
 
                 case CMD_CLEAR_QUEUE:
@@ -46,6 +46,10 @@ void loop() {
 
                 case CMD_ZERO_POSITION:
                     Engine::zero_position();
+                    break;
+
+                case CMD_CLEAR_ERRORS:
+                    Engine::clear_errors();
                     break;
             }
         } else {

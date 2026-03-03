@@ -166,12 +166,19 @@ void Engine::emergency_stop() {
     atomic_set_target(0.0f);
     digitalWriteFast(PIN_ENABLE, HIGH); 
     system_error_flags |= 0x01;
+    last_step_period_us = 0; // Fix: Ensure next motion uses .begin()
 }
 
 void Engine::zero_position() {
     noInterrupts();
     global_position_steps = 0;
     target_position_steps = 0;
+    interrupts();
+}
+
+void Engine::clear_errors() {
+    noInterrupts();
+    system_error_flags = 0;
     interrupts();
 }
 
@@ -217,6 +224,7 @@ void Engine::control_loop_isr() {
     if (current_mode == MODE_STOP) {
         stepTimer.end();
         current_velocity_um_s = 0.0f;
+        last_step_period_us = 0; // Fix: Ensure next motion uses .begin()
         return;
     }
 

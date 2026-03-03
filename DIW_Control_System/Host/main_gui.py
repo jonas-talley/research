@@ -7,7 +7,8 @@ from collections import deque
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QLabel, QLineEdit, QTabWidget, QGroupBox, 
-    QProgressBar, QFileDialog, QMessageBox, QSpinBox, QDoubleSpinBox
+    QProgressBar, QFileDialog, QMessageBox, QSpinBox, QDoubleSpinBox,
+    QGridLayout
 )
 from PySide6.QtCore import Qt, QThread, Slot
 from serial_worker import SerialWorker
@@ -53,177 +54,222 @@ class DIWController(QMainWindow):
     def setup_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        layout = QVBoxLayout(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
 
-        # 1. Header
-        header_layout = QHBoxLayout()
+        # --- 1. GLOBAL DASHBOARD (Persistent Header) ---
+        header_frame = QGroupBox("System Overview")
+        header_layout = QHBoxLayout(header_frame)
+        
+        # Status & Connection
+        status_vbox = QVBoxLayout()
         self.lbl_status = QLabel("Status: Initializing...")
-        self.lbl_status.setStyleSheet("font-weight: bold; font-size: 14px; color: gray;")
-        header_layout.addWidget(self.lbl_status)
+        self.lbl_status.setStyleSheet("font-weight: bold; font-size: 13px; color: #555;")
+        self.lbl_log_status = QLabel("Logging: Inactive")
+        self.lbl_log_status.setStyleSheet("color: #2980b9; font-size: 11px;")
+        status_vbox.addWidget(self.lbl_status)
+        status_vbox.addWidget(self.lbl_log_status)
+        header_layout.addLayout(status_vbox)
         
-        self.lbl_position = QLabel("Pos: 0 steps")
-        self.lbl_position.setStyleSheet("font-size: 18px; font-weight: bold; color: magenta;")
         header_layout.addStretch()
-        header_layout.addWidget(self.lbl_position)
-        
-        layout.addLayout(header_layout)
 
-        # 2. Tabs
-        tabs = QTabWidget()
-        layout.addWidget(tabs)
+        # Telemetry Displays
+        self.lbl_position = QLabel("0 steps")
+        self.lbl_position.setStyleSheet("font-size: 22px; font-weight: bold; color: #8e44ad;")
+        pos_box = QVBoxLayout()
+        pos_box.addWidget(QLabel("Current Position:"), alignment=Qt.AlignCenter)
+        pos_box.addWidget(self.lbl_position, alignment=Qt.AlignCenter)
+        header_layout.addLayout(pos_box)
+
+        header_layout.addSpacing(40)
+
+        self.lbl_pressure_val = QLabel("0.0 kPa")
+        self.lbl_pressure_val.setStyleSheet("font-size: 22px; font-weight: bold; color: #16a085;")
+        press_box = QVBoxLayout()
+        press_box.addWidget(QLabel("Extruder Pressure:"), alignment=Qt.AlignCenter)
+        press_box.addWidget(self.lbl_pressure_val, alignment=Qt.AlignCenter)
+        header_layout.addLayout(press_box)
+
+        header_layout.addStretch()
+
+        # Global Stop & Reset
+        btn_layout = QHBoxLayout()
+        
+        self.btn_clear_errors = QPushButton("RESET SYSTEM")
+        self.btn_clear_errors.setFixedSize(100, 60)
+        self.btn_clear_errors.setStyleSheet("background-color: #34495e; color: white; font-weight: bold; font-size: 11px; border-radius: 5px;")
+        self.btn_clear_errors.clicked.connect(self.cmd_clear_errors)
+        
+        self.btn_global_stop = QPushButton("STOP")
+        self.btn_global_stop.setFixedSize(100, 60)
+        self.btn_global_stop.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold; font-size: 16px; border-radius: 5px;")
+        self.btn_global_stop.clicked.connect(self.cmd_stop)
+        
+        btn_layout.addWidget(self.btn_clear_errors)
+        btn_layout.addWidget(self.btn_global_stop)
+        header_layout.addLayout(btn_layout)
+        
+        main_layout.addWidget(header_frame)
+
+        # --- 2. CONTROL AREA (Tabs) ---
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
 
         # Tab 1: Manual
         self.tab_manual = QWidget()
         self.setup_manual_tab(self.tab_manual)
-        tabs.addTab(self.tab_manual, "Manual Control")
+        self.tabs.addTab(self.tab_manual, "Manual Control")
 
         # Tab 2: Smart Streamer
         self.tab_stream = QWidget()
         self.setup_stream_tab(self.tab_stream)
-        tabs.addTab(self.tab_stream, "Trajectory Streamer")
+        self.tabs.addTab(self.tab_stream, "Trajectory Streamer")
         
-        # Tab 3: Session Config
+        # Tab 3: Configuration
         self.tab_settings = QWidget()
         self.setup_settings_tab(self.tab_settings)
-        tabs.addTab(self.tab_settings, "Session Config")
+        self.tabs.addTab(self.tab_settings, "Settings & Logging")
 
-        # 3. Plots
-        self.setup_plots(layout)
+        # --- 3. PLOTS AREA ---
+        self.setup_plots(main_layout)
 
     def setup_manual_tab(self, parent):
         layout = QVBoxLayout(parent)
         
+        # Layout for Group Boxes
+        h_layout = QHBoxLayout()
+
         # A. Velocity Control
-        grp_vel = QGroupBox("1. Velocity Control (Jog)")
-        vel_layout = QHBoxLayout()
+        grp_vel = QGroupBox("Velocity Control (Jog)")
+        vel_layout = QVBoxLayout()
         
         self.spin_velocity = QDoubleSpinBox()
         self.spin_velocity.setRange(-5000.0, 5000.0)
         self.spin_velocity.setValue(self.default_vel)
         self.spin_velocity.setSuffix(" um/s")
         self.spin_velocity.setSingleStep(50.0)
+        self.spin_velocity.setMinimumHeight(30)
         
         btn_set = QPushButton("Run Constant Velocity")
+        btn_set.setMinimumHeight(40)
         btn_set.clicked.connect(self.cmd_set_velocity)
         
-        vel_layout.addWidget(QLabel("Speed:"))
+        vel_layout.addWidget(QLabel("Target Speed:"))
         vel_layout.addWidget(self.spin_velocity)
         vel_layout.addWidget(btn_set)
+        vel_layout.addStretch()
         grp_vel.setLayout(vel_layout)
-        layout.addWidget(grp_vel)
+        h_layout.addWidget(grp_vel)
 
         # B. Position Control
-        grp_pos = QGroupBox("2. Step Control (Move Relative)")
-        pos_layout = QHBoxLayout()
+        grp_pos = QGroupBox("Step Control (Relative Move)")
+        pos_layout = QVBoxLayout()
         
         self.spin_steps = QSpinBox()
         self.spin_steps.setRange(1, 1000000)
         self.spin_steps.setValue(self.default_steps)
         self.spin_steps.setSuffix(" steps")
-        self.spin_steps.setSingleStep(100)
+        self.spin_steps.setSingleStep(1000)
+        self.spin_steps.setMinimumHeight(30)
         
+        move_btns = QHBoxLayout()
         btn_move_p = QPushButton("Move (+)")
+        btn_move_p.setMinimumHeight(40)
         btn_move_p.clicked.connect(lambda: self.cmd_move_relative(1))
         
         btn_move_n = QPushButton("Move (-)")
+        btn_move_n.setMinimumHeight(40)
         btn_move_n.clicked.connect(lambda: self.cmd_move_relative(-1))
-        
-        btn_zero = QPushButton("Zero Pos")
-        btn_zero.setStyleSheet("background-color: #DDD;")
+        move_btns.addWidget(btn_move_n)
+        move_btns.addWidget(btn_move_p)
+
+        btn_zero = QPushButton("Set Origin (Zero)")
+        btn_zero.setMinimumHeight(30)
         btn_zero.clicked.connect(lambda: self.worker.send_command(CMD_ZERO_POSITION))
 
-        pos_layout.addWidget(QLabel("Distance:"))
+        pos_layout.addWidget(QLabel("Relative Distance:"))
         pos_layout.addWidget(self.spin_steps)
-        pos_layout.addWidget(btn_move_p)
-        pos_layout.addWidget(btn_move_n)
+        pos_layout.addLayout(move_btns)
         pos_layout.addWidget(btn_zero)
+        pos_layout.addStretch()
         grp_pos.setLayout(pos_layout)
-        layout.addWidget(grp_pos)
+        h_layout.addWidget(grp_pos)
 
-        # C. Stop
-        btn_stop = QPushButton("STOP ALL MOTION")
-        btn_stop.setMinimumHeight(50)
-        btn_stop.setStyleSheet("background-color: orange; font-weight: bold;")
-        btn_stop.clicked.connect(self.cmd_stop)
-        layout.addWidget(btn_stop)
-
-        layout.addStretch()
+        layout.addLayout(h_layout)
 
     def setup_stream_tab(self, parent):
         layout = QVBoxLayout(parent)
         
-        # Instructions
-        layout.addWidget(QLabel("Supports: .csv (Teensy Only) AND .gcode/.nc (Aerotech + Teensy)"))
-
-        # File Loading
+        # File Loading Section
+        grp_file = QGroupBox("Job Selection")
         file_layout = QHBoxLayout()
-        self.lbl_filename = QLabel("No file loaded")
-        self.lbl_filename.setStyleSheet("font-weight: bold;")
+        self.lbl_filename = QLabel("No job file loaded")
+        self.lbl_filename.setStyleSheet("font-style: italic; color: #7f8c8d;")
         
-        btn_load = QPushButton("Load File...")
-        btn_load.setMinimumHeight(40)
+        btn_load = QPushButton("Select File...")
+        btn_load.setMinimumHeight(30)
         btn_load.clicked.connect(self.load_file)
         
         file_layout.addWidget(btn_load)
         file_layout.addWidget(self.lbl_filename)
-        layout.addLayout(file_layout)
+        file_layout.addStretch()
+        grp_file.setLayout(file_layout)
+        layout.addWidget(grp_file)
 
-        # Controls
+        # Progress Section
+        grp_prog = QGroupBox("Execution Progress")
+        prog_layout = QVBoxLayout()
+        
+        self.prog_stream = QProgressBar()
+        prog_layout.addWidget(QLabel("Overall Playlist Progress:"))
+        prog_layout.addWidget(self.prog_stream)
+        
+        self.prog_buffer = QProgressBar()
+        self.prog_buffer.setRange(0, 512)
+        self.prog_buffer.setFormat("Hardware Command Buffer: %v / 512")
+        prog_layout.addWidget(self.prog_buffer)
+        grp_prog.setLayout(prog_layout)
+        layout.addWidget(grp_prog)
+
+        # Control Buttons
         ctrl_layout = QHBoxLayout()
-        btn_start = QPushButton("Start Stream")
+        btn_start = QPushButton("START TRAJECTORY")
         btn_start.setMinimumHeight(50)
-        btn_start.setStyleSheet("background-color: green; color: white; font-size: 14px;")
+        btn_start.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; font-size: 14px;")
         btn_start.clicked.connect(self.start_streaming)
         
-        btn_abort = QPushButton("Abort / Reset")
+        btn_abort = QPushButton("ABORT")
         btn_abort.setMinimumHeight(50)
-        btn_abort.setStyleSheet("background-color: #e74c3c; color: white; font-size: 14px;")
+        btn_abort.setStyleSheet("background-color: #e67e22; color: white; font-weight: bold; font-size: 14px;")
         btn_abort.clicked.connect(self.abort_stream)
         
         ctrl_layout.addWidget(btn_start)
         ctrl_layout.addWidget(btn_abort)
         layout.addLayout(ctrl_layout)
 
-        # Progress
-        self.prog_stream = QProgressBar()
-        layout.addWidget(QLabel("Playlist Progress:"))
-        layout.addWidget(self.prog_stream)
-        
-        self.prog_buffer = QProgressBar()
-        self.prog_buffer.setRange(0, 512)
-        self.prog_buffer.setFormat("Hardware Buffer: %v / 512")
-        layout.addWidget(self.prog_buffer)
-        layout.addStretch()
-
     def setup_settings_tab(self, parent):
         layout = QVBoxLayout(parent)
         
-        # 1. Data Logging
+        # Logging Config
         grp_log = QGroupBox("Data Logging")
-        log_layout = QVBoxLayout()
+        log_layout = QGridLayout()
         
-        self.lbl_log_status = QLabel("Logging to: Default")
-        self.lbl_log_status.setStyleSheet("color: blue;")
-        log_layout.addWidget(self.lbl_log_status)
-
-        file_input_layout = QHBoxLayout()
         self.txt_log_name = QLineEdit()
         default_ts = f"exp_{datetime.datetime.now().strftime('%H%M')}.csv"
         self.txt_log_name.setText(default_ts)
 
-        btn_apply_log = QPushButton("Apply Log File")
+        btn_apply_log = QPushButton("Update Log Filename")
         btn_apply_log.clicked.connect(self.cmd_update_log_name)
 
-        file_input_layout.addWidget(QLabel("Filename:"))
-        file_input_layout.addWidget(self.txt_log_name)
-        file_input_layout.addWidget(btn_apply_log)
-        
-        log_layout.addLayout(file_input_layout)
+        log_layout.addWidget(QLabel("Output File:"), 0, 0)
+        log_layout.addWidget(self.txt_log_name, 0, 1)
+        log_layout.addWidget(btn_apply_log, 0, 2)
         grp_log.setLayout(log_layout)
         layout.addWidget(grp_log)
 
-        # 2. Plot Config
-        grp_plot = QGroupBox("Plot Configuration")
+        # Plot Config
+        grp_plot = QGroupBox("Visualization Settings")
         plot_layout = QHBoxLayout()
         
         self.spin_points = QSpinBox()
@@ -232,7 +278,7 @@ class DIWController(QMainWindow):
         self.spin_points.setSingleStep(100)
         self.spin_points.valueChanged.connect(self.update_plot_settings)
         
-        plot_layout.addWidget(QLabel("History Points:"))
+        plot_layout.addWidget(QLabel("Rolling History Window (points):"))
         plot_layout.addWidget(self.spin_points)
         plot_layout.addStretch()
         grp_plot.setLayout(plot_layout)
@@ -319,8 +365,8 @@ class DIWController(QMainWindow):
         # 1. Clear Old Buffer (Fixes the "System Locked" issue)
         self.worker.send_command(CMD_CLEAR_QUEUE)
         
-        # 2. Pre-load the teensy
-        # This will fill the first like 400 buffer slots immediately
+        # 2. Arm Teensy (Now includes Pre-load)
+        # This will fill the first 32 buffer slots immediately
         self.worker.queue_stream(self.pending_moves)
         
         # 3. Prepare Aerotech (If G-Code mode)
@@ -349,7 +395,7 @@ class DIWController(QMainWindow):
         if driver and self.pending_pgm:
             print("Triggering Stage Motion...")
             success, msg = driver.run_pgm(pgm_filename)
-            if not success: #I have never seen this case activate, unsure if it would trigger.
+            if not success:
                 QMessageBox.critical(self, "Stage Error", f"Aerotech refused start: {msg}")
                 self.worker.send_command(CMD_EMERGENCY_STOP) 
                 return
@@ -370,6 +416,10 @@ class DIWController(QMainWindow):
                 driver.reset_task(1)
             except:
                 pass
+
+    def cmd_clear_errors(self):
+        self.worker.send_command(CMD_CLEAR_ERRORS)
+        self.lbl_status.setText("Status: Errors Cleared")
 
     def cmd_set_velocity(self):
         val = self.spin_velocity.value()
@@ -399,7 +449,8 @@ class DIWController(QMainWindow):
 
     @Slot(dict)
     def update_plots(self, data):
-        self.lbl_position.setText(f"Pos: {data['position_steps']} steps")
+        self.lbl_position.setText(f"{data['position_steps']} steps")
+        self.lbl_pressure_val.setText(f"{data['pressure']:.1f} kPa")
         self.prog_buffer.setValue(data['buffer'])
 
         self.data_history['time'].append(data['time'])

@@ -12,6 +12,7 @@ enum Opcode : uint8_t {
     CMD_START_QUEUE     = 0x12, 
     CMD_MOVE_RELATIVE   = 0x20, 
     CMD_ZERO_POSITION   = 0x21, 
+    CMD_CLEAR_ERRORS    = 0x22,
     CMD_PING            = 0x99
 };
 
